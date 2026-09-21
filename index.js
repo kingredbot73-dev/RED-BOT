@@ -1,127 +1,118 @@
-/**
- * KINGRED MD — SaaS Server
- *
- * The original KINGRED MD browser session remains available for bot setup.
- * The optional server registry uses a separate password-authenticated account
- * stored in the existing local application database directory.
- */
+import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import { GoogleGenAI } from '@google/genai';
+import 'dotenv/config';
 
-const path = require("path");
-const kingredWebhook = require("./saas/kingredWebhook");
-const { isAdminAuthenticated } = require("./saas/adminAuth");
-const botManager = require("./saas/botManager");
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const BOT_NAME = process.env.BOT_NAME || 'KINDRED MD';
+const PREFIX = process.env.PREFIX || '!';
 
-// ── Log noise filter ──────────────────────────────────────────────────────────
-const _origError = console.error.bind(console);
-const _origLog = console.log.bind(console);
+let antiLinkEnabled = true;
 
-const CLEAN_SIGNAL_ERRORS = [
-    { match: "Bad MAC", msg: "⚠️ [Signal] Corrupt session key — will auto-refresh." },
-    { match: "No matching sessions found", msg: "⚠️ [Signal] No session found — awaiting key exchange." },
-    { match: "No session found to decrypt", msg: "⚠️ [Signal] Missing sender key — will resolve automatically." },
-    { match: "Failed to decrypt message with any known session", msg: "⚠️ [Signal] All session keys failed." },
-    { match: "Closing open session in favor of incoming prekey", msg: "ℹ️ [Signal] Re-keying session." },
-    { match: "Closing session:", msg: "ℹ️ [Signal] Closing stale session." },
-    { match: "Decrypted message with closed session", msg: "ℹ️ [Signal] Decrypted via closed session (harmless)." },
-    { match: "transaction failed, rolling back", msg: "⚠️ [Signal] Transaction rollback (non-fatal)." },
-    { match: "_chains", msg: null },
-    { match: "registrationId", msg: null },
-    { match: "currentRatchet", msg: null },
-    { match: "pendingPreKey", msg: null },
-    { match: "indexInfo", msg: null },
-    { match: "baseKeyType", msg: null },
-    { match: "ephemeralKeyPair",msg: null },
-];
+const SYSTEM_INSTRUCTION = `
+You are "${BOT_NAME}," a knowledgeable, warm, and empathetic medical educational assistant.
+1. Clarity & Tone: Use clear, supportive, plain language. Avoid unexplained jargon.
+2. Disclaimer Requirement: ALWAYS include a note that you are an AI assistant providing general educational info, NOT a doctor.
+3. Emergency Protocol: If users mention chest pain, severe bleeding, or sudden weakness, advise calling 911/emergency services immediately.
+4. Keep answers clean with markdown formatting.
+`;
 
-const _logCooldowns = new Map();
-const COOLDOWN_MS = 30_000;
+async function startBot() {
+  // Uses the saved credentials directory
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-function interceptLog(originalFn, args) {
-    const raw = String(args[0]?? "");
-    for (const { match, msg } of CLEAN_SIGNAL_ERRORS) {
-        if (raw.includes(match)) {
-            if (msg === null) return;
-            const now = Date.now();
-            if (now - (_logCooldowns.get(match) || 0) >= COOLDOWN_MS) {
-                _logCooldowns.set(match, now);
-                _origLog(msg);
-            }
-            return;
-        }
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed. Reconnecting...', shouldReconnect);
+      if (shouldReconnect) startBot();
+    } else if (connection === 'open') {
+      console.log(`\n✅ ${BOT_NAME} is connected and live on WhatsApp!\n`);
     }
-    originalFn(...args);
+  });
+
+  // Message Handler & Antilink Moderation
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      const chatId = msg.key.remoteJid;
+      const isGroup = chatId.endsWith('@g.us');
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+
+      // 1. Antilink Group Filter
+      const linkRegex = /(https?:\/\/[^\s]+|chat\.whatsapp\.com\/[^\s]+)/gi;
+      if (isGroup && antiLinkEnabled && linkRegex.test(text)) {
+        try {
+          const groupMetadata = await sock.groupMetadata(chatId);
+          const sender = msg.key.participant;
+          const participant = groupMetadata.participants.find(p => p.id === sender);
+          const isAdmin = participant?.admin === 'admin' || participant?.admin === 'superadmin';
+
+          if (!isAdmin) {
+            await sock.sendMessage(chatId, { delete: msg.key });
+            await sock.sendMessage(chatId, {
+              text: `⚠️ @${sender.split('@')[0]}, links are strictly forbidden in this group! Message deleted by *${BOT_NAME}*.`,
+              mentions: [sender]
+            });
+            continue;
+          }
+        } catch (e) {
+          console.error('Antilink error:', e);
+        }
+      }
+
+      // 2. Command Processing
+      if (!text.startsWith(PREFIX)) continue;
+      const args = text.slice(PREFIX.length).trim().split(/ +/);
+      const command = args.shift().toLowerCase();
+
+      if (command === 'antilink') {
+        const option = args[0]?.toLowerCase();
+        if (option === 'on') {
+          antiLinkEnabled = true;
+          await sock.sendMessage(chatId, { text: `✅ *${BOT_NAME}:* Antilink is ENABLED.` });
+        } else if (option === 'off') {
+          antiLinkEnabled = false;
+          await sock.sendMessage(chatId, { text: `❌ *${BOT_NAME}:* Antilink is DISABLED.` });
+        } else {
+          await sock.sendMessage(chatId, { text: `Usage: ${PREFIX}antilink on \vert{}${PREFIX}antilink off` });
+        }
+        continue;
+      }
+
+      if (command === 'ask') {
+        const userPrompt = args.join(' ');
+        if (!userPrompt) {
+          await sock.sendMessage(chatId, { text: `Please provide a health question. Example: \`${PREFIX}ask What causes migraines?\`` });
+          continue;
+        }
+
+        try {
+          await sock.sendMessage(chatId, { text: `🩺 *${BOT_NAME}* is typing...` });
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: userPrompt,
+            config: { systemInstruction: SYSTEM_INSTRUCTION }
+          });
+          await sock.sendMessage(chatId, { text: response.text });
+        } catch (error) {
+          console.error(error);
+          await sock.sendMessage(chatId, { text: `❌ Error processing request.` });
+        }
+      }
+    }
+  });
 }
 
-console.error = (...args) => interceptLog(_origError, args);
-console.log = (...args) => interceptLog(_origLog, args);
-
-process.on("unhandledRejection", (reason) => _origError("⚠️ Unhandled Rejection:", reason));
-process.on("uncaughtException", (error) => _origError("⚠️ Uncaught Exception:", error));
-
-// ── Express ───────────────────────────────────────────────────────────────────
-const express = require("express");
-const session = require("express-session");
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-app.use(session({
-    secret: process.env.SESSION_SECRET || require("crypto").randomBytes(32).toString("hex"),
-    resave: false,
-    saveUninitialized: true,
-    cookie: {
-        secure: process.env.NODE_ENV === "production",
-        httpOnly: true,
-        sameSite: "lax",
-        maxAge: 30 * 24 * 60 * 60 * 1000,
-    },
-}));
-
-// ── Static files ──────────────────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, "public"), { index: false }));
-
-// ── Bot API (/api/bot/*) ──────────────────────────────────────────────────────
-app.use("/api/auth", require("./saas/authApiRoutes"));
-app.use("/api/admin", require("./saas/adminApiRoutes"));
-app.use("/api/bot", require("./saas/userApiRoutes"));
-const { createDatabaseApiRouter } = require("./saas/kingredDatabaseApi");
-const { requireAdmin } = require("./saas/adminAuth");
-app.use("/api/kingred-database/v1", createDatabaseApiRouter());
-app.use("/api/kingred/database", createDatabaseApiRouter());
-app.use("/api/admin/kingred-database", require("./saas/kingredDatabaseApi").createAdminRouter(requireAdmin));
-
-// ── Pages ─────────────────────────────────────────────────────────────────────
-const serverWorkspace = path.join(__dirname, "public", "servers.html");
-const tokenWorkspace = path.join(__dirname, "public", "token.html");
-const codeWorkspace = path.join(__dirname, "public", "code.html");
-const adminWorkspace = path.join(__dirname, "public", "admin.html");
-const authWorkspace = path.join(__dirname, "public", "auth.html");
-const adminAccessWorkspace = path.join(__dirname, "public", "admin-access.html");
-const settingsWorkspace = path.join(__dirname, "public", "settings.html");
-
-app.get("/", (_req, res) => res.redirect("/token"));
-app.get("/token", (_req, res) => res.sendFile(tokenWorkspace));
-app.get("/code", (_req, res) => res.sendFile(codeWorkspace));
-app.get("/admin", (req, res) => { if (!isAdminAuthenticated(req)) return res.sendFile(adminAccessWorkspace); return res.sendFile(adminWorkspace); });
-app.get("/auth", (_req, res) => res.redirect("/"));
-app.get("/settings", (_req, res) => res.redirect("/token"));
-app.get("/connect", (_req, res) => res.redirect("/token"));
-app.get("/dashboard", (_req, res) => res.redirect("/token"));
-app.get("/bot-dashboard", (_req, res) => res.redirect("/token"));
-app.get("/login", (_req, res) => res.redirect("/token"));
-app.get("/servers", (_req, res) => res.redirect("/token"));
-app.get("/pair", (_req, res) => res.redirect("/code"));
-
-app.get("/health", (req, res) => res.send("🤖 KINGRED MD SaaS is Online!"));
-
-// ── Listen ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-    console.log(`🌍 KINGRED MD SaaS listening on port ${PORT}`);
-    kingredWebhook.start();
-    botManager.restorePersisted().catch((error) => console.error("❌ Persistent bot restore failed:", error.message));
-});
+startBot();
